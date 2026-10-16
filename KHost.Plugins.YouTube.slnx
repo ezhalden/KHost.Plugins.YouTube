@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/KHost.Plugins.YouTube/KHost.Plugins.YouTube.csproj" />
+  </Folder>
+
+  <Folder Name="/tests/">
+    <Project Path="tests/KHost.Plugins.YouTube.Tests/KHost.Plugins.YouTube.Tests.csproj" />
+  </Folder>
+</Solution>
