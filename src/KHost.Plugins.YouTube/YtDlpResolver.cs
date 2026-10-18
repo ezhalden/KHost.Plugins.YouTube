@@ -1,0 +1,352 @@
+using System.Collections.Concurrent;
+using System.IO.Compression;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+
+namespace KHost.Plugins.YouTube;
+
+/// <summary>Finds yt-dlp: the configured path, then PATH, then a copy this plugin fetches itself.</summary>
+/// <remarks>Not packaged: yt-dlp updates itself, so bundling trades a same-day fix for a rebuild.</remarks>
+public sealed class YtDlpResolver
+{
+    private const string LatestAssetUrl = "https://github.com/yt-dlp/yt-dlp/releases/latest/download";
+    internal const string HttpClientName = "yt-dlp-download";
+    private const string SumsUrl = LatestAssetUrl + "/SHA2-512SUMS";
+
+    /// <summary>After a failed fetch, how long searches leave it alone: every search resolves yt-dlp,
+    /// so offline each one would otherwise retry a 35MB download and wait out its failure.</summary>
+    internal static readonly TimeSpan FailureBackOff = TimeSpan.FromMinutes(5);
+
+    /// <summary>How long a fetch may go without a byte. Idle rather than total: a slow link is still
+    /// moving and should finish, while a stalled one would otherwise hold every search for HttpClient's
+    /// 100 second header wait and never give up on the body at all.</summary>
+    internal static readonly TimeSpan DefaultStallTimeout = TimeSpan.FromSeconds(30);
+
+    // Static because the startup task and the search provider each build their own resolver, and a
+    // back-off one of them cannot see would not stop the other retrying.
+    private static readonly ConcurrentDictionary<string, (DateTimeOffset At, Exception Cause)> Failures = new();
+
+    private readonly Func<string?> _configuredPath;
+    private readonly string _toolsDirectory;
+    private readonly string? _pathVariable;
+    private readonly IHttpClientFactory? _httpClientFactory;
+    private readonly string _asset;
+    private readonly TimeSpan _stallTimeout;
+    private readonly TimeProvider _time;
+
+    /// <param name="asset">Overrides the asset for this platform. Only a test has cause to set it: the
+    /// archive-unpack path is published for one target and must not go unrun until a host hits it.</param>
+    public YtDlpResolver(
+        string? configuredPath,
+        string toolsDirectory,
+        string? pathVariable = null,
+        IHttpClientFactory? httpClientFactory = null,
+        string? asset = null,
+        TimeSpan? stallTimeout = null,
+        TimeProvider? time = null)
+        : this(() => configuredPath, toolsDirectory, pathVariable, httpClientFactory, asset, stallTimeout, time)
+    {
+    }
+
+    /// <summary>A resolver that asks for the configured path on every resolve, so a saved path
+    /// setting applies to the next search. A separate factory: a second public constructor makes
+    /// a null path ambiguous.</summary>
+    public static YtDlpResolver WithLivePath(
+        Func<string?> configuredPath, string toolsDirectory, IHttpClientFactory httpClientFactory)
+        => new(configuredPath, toolsDirectory, httpClientFactory: httpClientFactory);
+
+    private YtDlpResolver(
+        Func<string?> configuredPath,
+        string toolsDirectory,
+        string? pathVariable = null,
+        IHttpClientFactory? httpClientFactory = null,
+        string? asset = null,
+        TimeSpan? stallTimeout = null,
+        TimeProvider? time = null)
+    {
+        _configuredPath = configuredPath;
+        _toolsDirectory = toolsDirectory;
+        _pathVariable = pathVariable ?? Environment.GetEnvironmentVariable("PATH");
+        _httpClientFactory = httpClientFactory;
+        _asset = asset ?? AssetName;
+        _stallTimeout = stallTimeout ?? DefaultStallTimeout;
+        _time = time ?? TimeProvider.System;
+    }
+
+    /// <summary>The release asset this OS and architecture needs.</summary>
+    /// <exception cref="PlatformNotSupportedException">No build is published for this combination.</exception>
+    public static string AssetName
+    {
+        get
+        {
+            if (OperatingSystem.IsWindows())
+                return RuntimeInformation.OSArchitecture switch
+                {
+                    Architecture.Arm64 => "yt-dlp_arm64.exe",
+                    Architecture.X86 => "yt-dlp_x86.exe",
+                    _ => "yt-dlp.exe",
+                };
+
+            // One universal2 build covers both Intel and Apple silicon, so architecture is moot here.
+            if (OperatingSystem.IsMacOS())
+                return "yt-dlp_macos";
+
+            if (!OperatingSystem.IsLinux())
+                throw new PlatformNotSupportedException($"yt-dlp publishes no build for {RuntimeInformation.OSDescription}.");
+
+            // Alpine and friends: the glibc builds will not load against musl's loader.
+            if (IsMusl)
+                return RuntimeInformation.OSArchitecture switch
+                {
+                    Architecture.Arm64 => "yt-dlp_musllinux_aarch64",
+                    Architecture.X64 => "yt-dlp_musllinux",
+                    _ => throw new PlatformNotSupportedException(
+                        "yt-dlp publishes no musl build for 32-bit ARM. Install it yourself and set the yt-dlp path setting."),
+                };
+
+            return RuntimeInformation.OSArchitecture switch
+            {
+                Architecture.Arm64 => "yt-dlp_linux_aarch64",
+
+                // The one target published only as an archive, and a directory bundle rather than a
+                // single file (see Extract).
+                Architecture.Arm => "yt-dlp_linux_armv7l.zip",
+
+                _ => "yt-dlp_linux",
+            };
+        }
+    }
+
+    /// <summary>What the binary is called once it is ours, whatever the asset was named.</summary>
+    public static string ExecutableName => OperatingSystem.IsWindows() ? "yt-dlp.exe" : "yt-dlp";
+
+    /// <summary>Whether this path is a copy the plugin downloaded, and so one it may update.
+    /// A brew/apt/winget yt-dlp reports itself as pip and refuses <c>-U</c>, its manager's job.</summary>
+    public bool OwnsCopyAt(string executablePath)
+        => Path.GetFullPath(executablePath)
+            .StartsWith(Path.GetFullPath(_toolsDirectory) + Path.DirectorySeparatorChar, StringComparison.Ordinal);
+
+    /// <summary>True on musl libc, where the ordinary Linux builds will not run. The runtime
+    /// identifier says so on a musl .NET build; the loader on disk covers a portable one.</summary>
+    private static bool IsMusl
+        => RuntimeInformation.RuntimeIdentifier.Contains("musl", StringComparison.OrdinalIgnoreCase)
+            || (Directory.Exists("/lib") && Directory.EnumerateFiles("/lib", "ld-musl-*").Any());
+
+    public async Task<string> ResolveAsync(CancellationToken cancellationToken = default)
+    {
+        var configuredPath = _configuredPath();
+
+        if (!string.IsNullOrWhiteSpace(configuredPath))
+        {
+            // A configured path that is wrong is a mistake to report. Quietly downloading a second
+            // copy would leave the host tuning a binary that is not the one being run.
+            if (!File.Exists(configuredPath))
+                throw new FileNotFoundException(
+                    $"yt-dlp is not at the configured path '{configuredPath}'.", configuredPath);
+
+            return configuredPath;
+        }
+
+        return FindOnPath() ?? await DownloadAsync(cancellationToken);
+    }
+
+    private string? FindOnPath()
+    {
+        if (string.IsNullOrEmpty(_pathVariable)) return null;
+
+        foreach (var directory in _pathVariable.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries))
+        {
+            var candidate = Path.Combine(directory.Trim(), ExecutableName);
+
+            if (File.Exists(candidate)) return candidate;
+        }
+
+        return null;
+    }
+
+    private async Task<string> DownloadAsync(CancellationToken cancellationToken)
+    {
+        var asset = _asset;
+        var isArchive = asset.EndsWith(".zip", StringComparison.OrdinalIgnoreCase);
+
+        // An archive unpacks to a folder of its own: the launcher will not run without the
+        // _internal directory that ships beside it.
+        var destination = isArchive
+            ? Path.Combine(_toolsDirectory, Path.GetFileNameWithoutExtension(asset), Path.GetFileNameWithoutExtension(asset))
+            : Path.Combine(_toolsDirectory, ExecutableName);
+
+        if (File.Exists(destination)) return destination;
+
+        var key = Path.GetFullPath(_toolsDirectory);
+
+        if (Failures.TryGetValue(key, out var failure) && _time.GetUtcNow() - failure.At < FailureBackOff)
+            throw new YtDlpUnavailableException(failure.Cause);
+
+        try
+        {
+            await FetchAsync(asset, isArchive, destination, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // A cancel is the caller's choice, not the fetch failing, so it earns no back-off.
+            Failures[key] = (_time.GetUtcNow(), ex);
+            throw;
+        }
+
+        return destination;
+    }
+
+    private async Task FetchAsync(string asset, bool isArchive, string destination, CancellationToken cancellationToken)
+    {
+        Directory.CreateDirectory(_toolsDirectory);
+
+        // Staged, then moved. A download that dies halfway leaves a truncated file that File.Exists
+        // is perfectly happy with, and every later run would reuse it without ever retrying.
+        var staging = Path.Combine(_toolsDirectory, asset + ".downloading");
+
+        // The factory's resilience handler bounds only the headers here: the body is streamed below
+        // under the per-read stall limit, so a 35MB download is not cut at the handler's total timeout.
+        using var http = (_httpClientFactory
+            ?? throw new InvalidOperationException("Fetching yt-dlp needs an IHttpClientFactory.")).CreateClient(HttpClientName);
+
+        try
+        {
+            using var response = await Bounded(
+                token => http.GetAsync($"{LatestAssetUrl}/{asset}", HttpCompletionOption.ResponseHeadersRead, token),
+                _stallTimeout, cancellationToken);
+            response.EnsureSuccessStatusCode();
+
+            await using (var source = await response.Content.ReadAsStreamAsync(cancellationToken))
+            await using (var file = File.Create(staging))
+            {
+                var buffer = new byte[81920];
+
+                // Each read gets its own clock: CopyToAsync has no way to give up on a body that went quiet.
+                while (await Bounded(
+                    token => source.ReadAsync(buffer, token).AsTask(), _stallTimeout, cancellationToken) is var read and > 0)
+                {
+                    await file.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                }
+            }
+
+            await VerifyChecksumAsync(http, staging, asset, _stallTimeout, cancellationToken);
+
+            if (isArchive)
+                Extract(staging, destination);
+            else
+                File.Move(staging, destination, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(staging)) File.Delete(staging);
+        }
+
+        MakeExecutable(destination);
+    }
+
+    /// <summary>Runs one network step under an idle limit. A trip surfaces as a TimeoutException, so
+    /// it is told apart from the caller's own cancel, which must stay a cancel.</summary>
+    private static async Task<T> Bounded<T>(
+        Func<CancellationToken, Task<T>> step, TimeSpan limit, CancellationToken cancellationToken)
+    {
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        linked.CancelAfter(limit);
+
+        try
+        {
+            return await step(linked.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException($"yt-dlp's download made no progress for {limit.TotalSeconds:0} seconds.");
+        }
+    }
+
+    /// <summary>A compromised release looks like an ordinary download; SUMS is the only proof the
+    /// bytes on disk are what yt-dlp shipped, so any failure to confirm that is fatal, not silent.</summary>
+    private static async Task VerifyChecksumAsync(
+        HttpClient http, string stagedFile, string asset, TimeSpan stallTimeout, CancellationToken cancellationToken)
+    {
+        string sums;
+
+        try
+        {
+            sums = await Bounded(async token =>
+            {
+                using var response = await http.GetAsync(SumsUrl, token);
+                response.EnsureSuccessStatusCode();
+                return await response.Content.ReadAsStringAsync(token);
+            }, stallTimeout, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            throw new InvalidOperationException(
+                $"Could not fetch yt-dlp's SHA2-512SUMS to verify '{asset}' before running it.", ex);
+        }
+
+        var expected = FindExpectedHash(sums, asset)
+            ?? throw new InvalidOperationException(
+                $"yt-dlp's SHA2-512SUMS has no entry for '{asset}' — refusing to run an unverified download.");
+
+        string actual;
+        await using (var stream = File.OpenRead(stagedFile))
+        {
+            actual = Convert.ToHexStringLower(await SHA512.HashDataAsync(stream, cancellationToken));
+        }
+
+        if (!string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException(
+                $"Downloaded '{asset}' does not match yt-dlp's published SHA-512 checksum — refusing to run it.");
+    }
+
+    /// <summary>Each line is "&lt;sha512&gt; &lt;filename&gt;", the archive filename with ".zip".</summary>
+    private static string? FindExpectedHash(string sums, string asset)
+    {
+        foreach (var line in sums.Split('\n'))
+        {
+            var parts = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+
+            if (parts.Length >= 2 && string.Equals(parts[^1], asset, StringComparison.Ordinal))
+                return parts[0];
+        }
+
+        return null;
+    }
+
+    /// <summary>Unpacks beside the launcher, then swaps the whole folder into place.</summary>
+    private static void Extract(string archive, string destination)
+    {
+        var target = Path.GetDirectoryName(destination)!;
+        var staging = target + ".unpacking";
+
+        if (Directory.Exists(staging)) Directory.Delete(staging, recursive: true);
+
+        try
+        {
+            ZipFile.ExtractToDirectory(archive, staging);
+
+            // Moved whole rather than file by file: a half-populated folder still has a launcher in
+            // it, and File.Exists on that launcher would call the install good.
+            if (Directory.Exists(target)) Directory.Delete(target, recursive: true);
+
+            Directory.Move(staging, target);
+        }
+        finally
+        {
+            if (Directory.Exists(staging)) Directory.Delete(staging, recursive: true);
+        }
+    }
+
+    /// <summary>Nothing sets this for us: a zip carries no Unix mode extraction must honour, so
+    /// neither a download nor an unpack arrives executable.</summary>
+    private static void MakeExecutable(string path)
+    {
+        if (OperatingSystem.IsWindows()) return;
+
+        File.SetUnixFileMode(
+            path,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+            | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
+            | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+    }
+}
