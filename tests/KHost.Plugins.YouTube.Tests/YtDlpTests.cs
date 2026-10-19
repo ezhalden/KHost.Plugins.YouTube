@@ -1,0 +1,263 @@
+using KHost.Plugins.YouTube;
+using System.Diagnostics;
+
+namespace KHost.Plugins.YouTube.Tests;
+
+public class YtDlpTests : IDisposable
+{
+    private readonly string _root = Path.Combine(Path.GetTempPath(), $"ytdlp-treekill-{Guid.NewGuid():N}");
+
+    public YtDlpTests() => Directory.CreateDirectory(_root);
+
+    public void Dispose()
+    {
+        // A process this test killed can still hold the directory for a moment on Windows, and a
+        // failure to tidy up must not be reported as the test failing.
+        try { if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true); }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    /// <summary>Stands in for yt-dlp. A real child process is the point of these tests, so the
+    /// process layer cannot be substituted away, and each platform gets the shell it actually has.</summary>
+    private static class Stub
+    {
+        // Absolute, because the resolver takes a configured path and rejects one it cannot see on
+        // disk: a bare "cmd.exe" resolves against the working directory and is not found.
+        private static readonly string Cmd =
+            Path.Combine(Environment.SystemDirectory, "cmd.exe");
+
+        private static readonly string PowerShell =
+            Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
+
+        public static (string Executable, string[] Arguments) Echo(params string[] lines) =>
+            OperatingSystem.IsWindows()
+                // No space before the separator: cmd takes one as part of the line it echoes.
+                ? (Cmd, ["/c", string.Join("&", lines.Select(line => $"echo {line}"))])
+                : ("/bin/sh", ["-c", string.Join("; ", lines.Select(line => $"echo {line}"))]);
+
+        /// <summary>Runs long enough that only cancellation ends it.</summary>
+        public static (string Executable, string[] Arguments) Sleep() =>
+            OperatingSystem.IsWindows()
+                ? (PowerShell, ["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+                : ("/bin/sleep", ["30"]);
+
+        /// <summary>Sleeps in a grandchild and reports its id, mirroring yt-dlp spawning ffmpeg:
+        /// killing only the top process leaves that one running and still writing its output.</summary>
+        public static (string Executable, string[] Arguments) SleepInAChild(string pidFile) =>
+            OperatingSystem.IsWindows()
+                ? (PowerShell,
+                    [
+                        "-NoProfile", "-Command",
+                        "$child = Start-Process powershell "
+                        + "-ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 30' "
+                        + "-PassThru -WindowStyle Hidden; "
+                        + $"Set-Content -LiteralPath '{pidFile}' -Value $child.Id; "
+                        + "Wait-Process -Id $child.Id",
+                    ])
+                : ("/bin/sh", ["-c", $"sleep 30 & echo $! > '{pidFile}'; wait"]);
+    }
+
+    private YtDlp Build((string Executable, string[] Arguments) stub)
+        => new(new YtDlpResolver(stub.Executable, _root));
+
+    [Fact]
+    public async Task RunAsync_OnLineSupplied_ReceivesEachLineAsItArrivesAndTheFullOutputIsStillReturned()
+    {
+        var stub = Stub.Echo("one", "two", "three");
+
+        var seen = new List<string>();
+        var output = await Build(stub).RunAsync(stub.Arguments, onLine: seen.Add);
+
+        Assert.Equal(["one", "two", "three"], seen);
+        Assert.Equal("one\ntwo\nthree", output);
+    }
+
+    [Fact]
+    public async Task RunAsync_NoOnLineSupplied_StillReturnsFullOutput()
+    {
+        var stub = Stub.Echo("one", "two");
+
+        var output = await Build(stub).RunAsync(stub.Arguments);
+
+        Assert.Equal("one\ntwo", output);
+    }
+
+    [Fact]
+    public async Task RunAsync_Cancelled_ThrowsOperationCanceled()
+    {
+        var stub = Stub.Sleep();
+
+        using var cts = new CancellationTokenSource();
+        var run = Build(stub).RunAsync(stub.Arguments, cts.Token);
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
+    }
+
+    [Fact]
+    public async Task RunAsync_Cancelled_KillsTheWholeProcessTreeRatherThanJustTheTopProcess()
+    {
+        var pidFile = Path.Combine(_root, "child.pid");
+        var stub = Stub.SleepInAChild(pidFile);
+
+        using var cts = new CancellationTokenSource();
+        var run = Build(stub).RunAsync(stub.Arguments, cts.Token);
+
+        var childPid = await WaitForChildPidAsync(pidFile);
+
+        await cts.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
+
+        Assert.True(await WaitUntilDeadAsync(childPid), "child sleep process survived the cancel");
+    }
+
+    [Fact]
+    public async Task RunAsync_RunsPastItsTimeout_ThrowsATimeoutNotACancelAndKillsTheWholeTree()
+    {
+        var pidFile = Path.Combine(_root, "child.pid");
+        var stub = Stub.SleepInAChild(pidFile);
+
+        // Generous enough that a slow shell start does not trip it before the child reports in.
+        var run = Build(stub).RunAsync(stub.Arguments, timeout: TimeSpan.FromSeconds(3));
+        var childPid = await WaitForChildPidAsync(pidFile);
+
+        await Assert.ThrowsAsync<YtDlpTimeoutException>(() => run);
+
+        Assert.True(await WaitUntilDeadAsync(childPid), "child sleep process survived the timeout");
+    }
+
+    [Fact]
+    public async Task RunAsync_FinishesInsideItsTimeout_ReturnsTheOutput()
+    {
+        var stub = Stub.Echo("one");
+
+        var output = await Build(stub).RunAsync(stub.Arguments, timeout: TimeSpan.FromSeconds(30));
+
+        Assert.Equal("one", output);
+    }
+
+    [Fact]
+    public async Task RunAsync_CancelledByTheCallerWithATimeoutSet_StaysACancel()
+    {
+        var stub = Stub.Sleep();
+
+        using var cts = new CancellationTokenSource();
+        var run = Build(stub).RunAsync(stub.Arguments, cts.Token, timeout: TimeSpan.FromMinutes(5));
+        await cts.CancelAsync();
+
+        var ex = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
+        Assert.IsNotType<YtDlpTimeoutException>(ex);
+    }
+
+    [Fact]
+    public async Task RunAsync_NoYtDlpAndTheFetchFails_ThrowsUnavailableCarryingTheCause()
+    {
+        var resolver = new YtDlpResolver(null, _root, pathVariable: "", httpClientFactory: new StubHttpClientFactory(new ThrowingHandler()));
+
+        var ex = await Assert.ThrowsAsync<YtDlpUnavailableException>(() => new YtDlp(resolver).RunAsync(["--version"]));
+
+        Assert.IsType<HttpRequestException>(ex.InnerException);
+    }
+
+    [Fact]
+    public async Task RunAsync_FetchStillBackedOff_ThrowsUnavailableWithTheOriginalCauseNotAWrapperOfIt()
+    {
+        var resolver = new YtDlpResolver(null, _root, pathVariable: "", httpClientFactory: new StubHttpClientFactory(new ThrowingHandler()));
+        var ytDlp = new YtDlp(resolver);
+        await Assert.ThrowsAsync<YtDlpUnavailableException>(() => ytDlp.RunAsync(["--version"]));
+
+        var ex = await Assert.ThrowsAsync<YtDlpUnavailableException>(() => ytDlp.RunAsync(["--version"]));
+
+        Assert.IsType<HttpRequestException>(ex.InnerException);
+    }
+
+    [Fact]
+    public async Task RunAsync_CancelledWhileFetchingYtDlp_StaysACancelRatherThanBecomingUnavailable()
+    {
+        var resolver = new YtDlpResolver(null, _root, pathVariable: "", httpClientFactory: new StubHttpClientFactory(new HangingHandler()));
+        using var cts = new CancellationTokenSource();
+
+        var run = new YtDlp(resolver).RunAsync(["--version"], cts.Token);
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
+    }
+
+    [Fact]
+    public async Task RunAsync_ConfiguredPathMissing_ThrowsItUnwrapped()
+    {
+        var resolver = new YtDlpResolver(Path.Combine(_root, "nowhere"), _root);
+
+        await Assert.ThrowsAsync<FileNotFoundException>(() => new YtDlp(resolver).RunAsync(["--version"]));
+    }
+
+    private sealed class HangingHandler : HttpMessageHandler
+    {
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+            return new HttpResponseMessage();
+        }
+    }
+
+    private sealed class ThrowingHandler : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+            => throw new HttpRequestException("network is down");
+    }
+
+    private static async Task<int> WaitForChildPidAsync(string pidFile)
+    {
+        // Generous: the Windows stub pays for a PowerShell start before it can report anything.
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+
+        while (DateTime.UtcNow < deadline)
+        {
+            if (File.Exists(pidFile))
+            {
+                // The file can be seen between being created and being written, so an empty read
+                // is a retry rather than a failure.
+                var text = (await ReadAllTextSafelyAsync(pidFile)).Trim();
+                if (int.TryParse(text, out var pid)) return pid;
+            }
+
+            await Task.Delay(25);
+        }
+
+        throw new TimeoutException("child sleep process never reported its pid");
+    }
+
+    private static async Task<string> ReadAllTextSafelyAsync(string path)
+    {
+        try { return await File.ReadAllTextAsync(path); }
+        catch (IOException) { return string.Empty; }
+    }
+
+    private static async Task<bool> WaitUntilDeadAsync(int pid)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+
+        while (DateTime.UtcNow < deadline)
+        {
+            if (!IsProcessAlive(pid)) return true;
+
+            await Task.Delay(25);
+        }
+
+        return !IsProcessAlive(pid);
+    }
+
+    private static bool IsProcessAlive(int pid)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(pid);
+            return !process.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
+}

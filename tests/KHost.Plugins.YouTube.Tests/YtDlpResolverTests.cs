@@ -1,0 +1,603 @@
+using KHost.Plugins.YouTube;
+using System.IO.Compression;
+using System.Net;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace KHost.Plugins.YouTube.Tests;
+
+public class YtDlpResolverTests : IDisposable
+{
+    private const string Payload = "#!/bin/sh\necho fake yt-dlp\n";
+
+    private readonly string _root = Path.Combine(Path.GetTempPath(), $"ytdlp-resolver-{Guid.NewGuid():n}");
+    private readonly FakeDownloadHandler _handler = new() { Body = Payload };
+    private readonly StubHttpClientFactory _factory;
+
+    private string ToolsDirectory => Path.Combine(_root, "tools");
+
+    // Empty rather than the real PATH: this machine may or may not have yt-dlp installed, and a test
+    // that passes only on one of those machines is worse than no test.
+    private YtDlpResolver Resolver(
+        string? configuredPath = null,
+        string? pathVariable = "",
+        string? asset = null,
+        TimeSpan? stallTimeout = null,
+        TimeProvider? time = null)
+        => new(configuredPath, ToolsDirectory, pathVariable, _factory, asset, stallTimeout, time);
+
+    public YtDlpResolverTests()
+    {
+        _factory = new StubHttpClientFactory(_handler);
+        Directory.CreateDirectory(_root);
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
+
+        GC.SuppressFinalize(this);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_PrefersTheConfiguredPath_WithoutDownloading()
+    {
+        var configured = Path.Combine(_root, "my-own-yt-dlp");
+        await File.WriteAllTextAsync(configured, Payload);
+
+        var resolved = await Resolver(configuredPath: configured).ResolveAsync();
+
+        Assert.Equal(configured, resolved);
+        Assert.Empty(_handler.Requests);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_ConfiguredPathChangedAfterConstruction_UsesTheNewOne()
+    {
+        var first = Path.Combine(_root, "first");
+        var second = Path.Combine(_root, "second");
+        await File.WriteAllTextAsync(first, Payload);
+        await File.WriteAllTextAsync(second, Payload);
+        var current = first;
+        var resolver = YtDlpResolver.WithLivePath(() => current, ToolsDirectory, _factory);
+
+        Assert.Equal(first, await resolver.ResolveAsync());
+
+        current = second;
+
+        Assert.Equal(second, await resolver.ResolveAsync());
+    }
+
+    [Fact]
+    public async Task ResolveAsync_ConfiguredPathThatIsNotThere_ThrowsRatherThanDownloading()
+    {
+        var missing = Path.Combine(_root, "nowhere", "yt-dlp");
+
+        var resolver = Resolver(configuredPath: missing);
+
+        await Assert.ThrowsAsync<FileNotFoundException>(() => resolver.ResolveAsync());
+
+        // The point of the throw: a silent download leaves the host tuning a binary that is not
+        // the one being run.
+        Assert.Empty(_handler.Requests);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_FallsBackToOneAlreadyOnPath()
+    {
+        var binDirectory = Path.Combine(_root, "bin");
+        Directory.CreateDirectory(binDirectory);
+
+        var onPath = Path.Combine(binDirectory, YtDlpResolver.ExecutableName);
+        await File.WriteAllTextAsync(onPath, Payload);
+
+        var resolved = await Resolver(pathVariable: binDirectory).ResolveAsync();
+
+        Assert.Equal(onPath, resolved);
+        Assert.Empty(_handler.Requests);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_DownloadsWhenThereIsNothingToFind()
+    {
+        var resolved = await Resolver().ResolveAsync();
+
+        Assert.Equal(Path.Combine(ToolsDirectory, YtDlpResolver.ExecutableName), resolved);
+        Assert.Equal(Payload, await File.ReadAllTextAsync(resolved));
+
+        // The asset itself, plus the SHA2-512SUMS fetch that verifies it before it is ever run.
+        Assert.Equal(2, _handler.Requests.Count);
+        Assert.Contains(_handler.Requests, r => r.Contains(YtDlpResolver.AssetName, StringComparison.Ordinal));
+        Assert.Contains(_handler.Requests, r => r.Contains("SHA2-512SUMS", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ResolveAsync_DownloadsThroughTheFactorysNamedClient()
+    {
+        await Resolver().ResolveAsync();
+
+        // Asset and checksum both reach the stub through the factory's client: a bare HttpClient
+        // would skip the host's resilience handler.
+        Assert.Equal(["yt-dlp-download"], _factory.Names);
+        Assert.Equal(2, _handler.Requests.Count);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_BodyIsStreamedToDiskRatherThanBufferedWithTheHeaders()
+    {
+        _handler.StagingPathProbe = Path.Combine(ToolsDirectory, YtDlpResolver.AssetName + ".downloading");
+
+        await Resolver().ResolveAsync();
+
+        // Buffered, the whole body is read inside GetAsync, before the staging file exists.
+        Assert.True(_handler.StagingExistedAtFirstBodyRead);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_ReusesTheCopyItAlreadyFetched()
+    {
+        await Resolver().ResolveAsync();
+        await Resolver().ResolveAsync();
+
+        // 35MB and a checksum fetch would be an expensive way to say "already have it".
+        Assert.Equal(2, _handler.Requests.Count);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_ADownloadThatDiesMidStream_LeavesNothingBehindToReuse()
+    {
+        // Mid-stream, not on connect: the staged file has to actually exist and hold bytes for the
+        // cleanup to have anything to do. A handler that throws before the first byte tests nothing.
+        _handler.FailMidStream = true;
+
+        await Assert.ThrowsAnyAsync<Exception>(() => Resolver().ResolveAsync());
+
+        // File.Exists is perfectly happy with half a binary, so anything left here would be reused
+        // forever and never retried.
+        Assert.False(File.Exists(Path.Combine(ToolsDirectory, YtDlpResolver.ExecutableName)));
+        Assert.Empty(Directory.Exists(ToolsDirectory) ? Directory.GetFiles(ToolsDirectory) : []);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_ADownloadThatCannotConnect_LeavesNothingBehindToReuse()
+    {
+        _handler.Throw = true;
+
+        await Assert.ThrowsAnyAsync<Exception>(() => Resolver().ResolveAsync());
+
+        Assert.False(File.Exists(Path.Combine(ToolsDirectory, YtDlpResolver.ExecutableName)));
+    }
+
+    [Fact]
+    public async Task ResolveAsync_ADownloadThatDoesNotMatchTheChecksum_LeavesNothingBehindToReuse()
+    {
+        // A wrong-on-purpose SUMS hash stands in for a tampered release or a corrupted transfer:
+        // either way the bytes on disk are not the bytes yt-dlp published.
+        _handler.CorruptSumsHash = true;
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => Resolver().ResolveAsync());
+        Assert.Contains(YtDlpResolver.AssetName, ex.Message);
+
+        Assert.False(File.Exists(Path.Combine(ToolsDirectory, YtDlpResolver.ExecutableName)));
+        Assert.Empty(Directory.Exists(ToolsDirectory) ? Directory.GetFiles(ToolsDirectory) : []);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_WhenTheChecksumsFileCannotBeFetched_LeavesNothingBehindToReuse()
+    {
+        // No SUMS to check against is exactly as unsafe as a wrong one: a check that no-ops when
+        // it cannot run is worthless.
+        _handler.SumsMissing = true;
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => Resolver().ResolveAsync());
+
+        Assert.False(File.Exists(Path.Combine(ToolsDirectory, YtDlpResolver.ExecutableName)));
+        Assert.Empty(Directory.Exists(ToolsDirectory) ? Directory.GetFiles(ToolsDirectory) : []);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_LeavesTheDownloadRunnable()
+    {
+        var resolved = await Resolver().ResolveAsync();
+
+        Assert.True(File.Exists(resolved));
+
+        // A zip carries no Unix mode, so a downloaded file arrives at 644 and nothing but the
+        // resolver puts the bit back.
+        if (!OperatingSystem.IsWindows())
+            Assert.True(File.GetUnixFileMode(resolved).HasFlag(UnixFileMode.UserExecute));
+    }
+
+    [Fact]
+    public async Task ResolveAsync_AnArchiveAsset_UnpacksAndReturnsTheLauncherInside()
+    {
+        // 32-bit ARM Linux is the one target published as a zip, and as a folder bundle rather than
+        // a lone binary: the launcher will not start without _internal beside it.
+        _handler.Body = null;
+        _handler.Asset = "yt-dlp_linux_armv7l.zip";
+        _handler.ZipEntries = new()
+        {
+            ["yt-dlp_linux_armv7l"] = "#!launcher",
+            ["_internal/base_library.zip"] = "payload",
+        };
+
+        var resolved = await Resolver(asset: "yt-dlp_linux_armv7l.zip").ResolveAsync();
+
+        var expected = Path.Combine(ToolsDirectory, "yt-dlp_linux_armv7l", "yt-dlp_linux_armv7l");
+
+        Assert.Equal(expected, resolved);
+        Assert.Equal("#!launcher", await File.ReadAllTextAsync(resolved));
+        Assert.True(File.Exists(Path.Combine(ToolsDirectory, "yt-dlp_linux_armv7l", "_internal", "base_library.zip")));
+
+        if (!OperatingSystem.IsWindows())
+            Assert.True(File.GetUnixFileMode(resolved).HasFlag(UnixFileMode.UserExecute));
+    }
+
+    [Fact]
+    public async Task ResolveAsync_AnArchiveItAlreadyUnpacked_IsNotFetchedAgain()
+    {
+        _handler.Body = null;
+        _handler.Asset = "yt-dlp_linux_armv7l.zip";
+        _handler.ZipEntries = new() { ["yt-dlp_linux_armv7l"] = "#!launcher" };
+
+        await Resolver(asset: "yt-dlp_linux_armv7l.zip").ResolveAsync();
+        await Resolver(asset: "yt-dlp_linux_armv7l.zip").ResolveAsync();
+
+        // The asset plus its SUMS fetch, once: the second resolve finds the unpacked launcher already there.
+        Assert.Equal(2, _handler.Requests.Count);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_ADownloadedArchive_DoesNotSurviveAsAStrayFile()
+    {
+        _handler.Body = null;
+        _handler.Asset = "yt-dlp_linux_armv7l.zip";
+        _handler.ZipEntries = new() { ["yt-dlp_linux_armv7l"] = "#!launcher" };
+
+        await Resolver(asset: "yt-dlp_linux_armv7l.zip").ResolveAsync();
+
+        // The zip itself is scratch. Leaving 36MB of it behind for every host is not a rounding error.
+        Assert.Empty(Directory.GetFiles(ToolsDirectory));
+    }
+
+    [Fact]
+    public async Task OwnsCopyAt_IsTrueOnlyForTheCopyItFetched()
+    {
+        var downloaded = await Resolver().ResolveAsync();
+        var resolver = Resolver();
+
+        Assert.True(resolver.OwnsCopyAt(downloaded));
+
+        // A packaged install reports itself as a pip build and refuses -U, so the plugin must not
+        // try to update one it did not put there.
+        Assert.False(resolver.OwnsCopyAt("/opt/homebrew/bin/yt-dlp"));
+        Assert.False(resolver.OwnsCopyAt("/usr/local/bin/yt-dlp"));
+    }
+
+    [Fact]
+    public void AssetName_NamesTheBuildPublishedForThisPlatform()
+    {
+        var asset = YtDlpResolver.AssetName;
+
+        if (OperatingSystem.IsMacOS())
+            // One universal2 build covers both arches, so there is no arm64 variant to pick.
+            Assert.Equal("yt-dlp_macos", asset);
+        else if (OperatingSystem.IsWindows())
+            Assert.EndsWith(".exe", asset);
+        else
+            // musllinux on Alpine, plain linux elsewhere: the glibc builds will not load on musl.
+            Assert.True(
+                asset.StartsWith("yt-dlp_linux", StringComparison.Ordinal)
+                || asset.StartsWith("yt-dlp_musllinux", StringComparison.Ordinal),
+                $"unexpected Linux asset '{asset}'");
+    }
+
+    private static readonly TimeSpan QuickStall = TimeSpan.FromMilliseconds(150);
+
+    private void AssertNothingLeftBehind()
+    {
+        Assert.False(File.Exists(Path.Combine(ToolsDirectory, YtDlpResolver.ExecutableName)));
+        Assert.Empty(Directory.Exists(ToolsDirectory) ? Directory.GetFiles(ToolsDirectory) : []);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_ServerNeverAnswers_GivesUpAsATimeoutInsteadOfWaitingOnHttpClientsDefault()
+    {
+        _handler.StallHeaders = true;
+
+        await Assert.ThrowsAsync<TimeoutException>(() => Resolver(stallTimeout: QuickStall).ResolveAsync());
+
+        AssertNothingLeftBehind();
+    }
+
+    [Fact]
+    public async Task ResolveAsync_BodyGoesQuietMidDownload_GivesUpAsATimeoutAndLeavesNothingBehind()
+    {
+        _handler.StallBody = true;
+
+        await Assert.ThrowsAsync<TimeoutException>(() => Resolver(stallTimeout: QuickStall).ResolveAsync());
+
+        AssertNothingLeftBehind();
+    }
+
+    [Fact]
+    public async Task ResolveAsync_ChecksumFetchNeverAnswers_FailsVerificationRatherThanHanging()
+    {
+        _handler.StallSums = true;
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => Resolver(stallTimeout: QuickStall).ResolveAsync());
+
+        Assert.IsType<TimeoutException>(ex.InnerException);
+        AssertNothingLeftBehind();
+    }
+
+    [Fact]
+    public async Task ResolveAsync_CancelledByTheCaller_StaysACancelAndIsNotTakenForATimeout()
+    {
+        _handler.StallHeaders = true;
+        using var cts = new CancellationTokenSource();
+        var resolve = Resolver(stallTimeout: TimeSpan.FromMinutes(5)).ResolveAsync(cts.Token);
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => resolve);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_AfterAFailedFetch_DoesNotTryAgainUntilTheBackOffPasses()
+    {
+        var time = new FakeTime();
+        _handler.Throw = true;
+        await Assert.ThrowsAsync<HttpRequestException>(() => Resolver(time: time).ResolveAsync());
+        var requestsAfterFailure = _handler.Requests.Count;
+
+        // The network is back, but a search a second later must not pay for another attempt.
+        _handler.Throw = false;
+        time.Now += TimeSpan.FromSeconds(1);
+
+        var ex = await Assert.ThrowsAsync<YtDlpUnavailableException>(() => Resolver(time: time).ResolveAsync());
+
+        Assert.IsType<HttpRequestException>(ex.InnerException);
+        Assert.Equal(requestsAfterFailure, _handler.Requests.Count);
+    }
+
+    [Fact]
+    public async Task ResolveAsync_JustInsideTheBackOff_StillDoesNotRetry()
+    {
+        var time = new FakeTime();
+        _handler.Throw = true;
+        await Assert.ThrowsAsync<HttpRequestException>(() => Resolver(time: time).ResolveAsync());
+
+        _handler.Throw = false;
+        time.Now += YtDlpResolver.FailureBackOff - TimeSpan.FromSeconds(1);
+
+        await Assert.ThrowsAsync<YtDlpUnavailableException>(() => Resolver(time: time).ResolveAsync());
+    }
+
+    [Fact]
+    public async Task ResolveAsync_OnceTheBackOffPasses_FetchesAgain()
+    {
+        var time = new FakeTime();
+        _handler.Throw = true;
+        await Assert.ThrowsAsync<HttpRequestException>(() => Resolver(time: time).ResolveAsync());
+
+        _handler.Throw = false;
+        time.Now += YtDlpResolver.FailureBackOff;
+
+        var resolved = await Resolver(time: time).ResolveAsync();
+
+        Assert.True(File.Exists(resolved));
+    }
+
+    [Fact]
+    public async Task ResolveAsync_ACancelledFetch_EarnsNoBackOff()
+    {
+        _handler.StallHeaders = true;
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Resolver().ResolveAsync(cts.Token));
+
+        _handler.StallHeaders = false;
+
+        Assert.True(File.Exists(await Resolver().ResolveAsync()));
+    }
+
+    private sealed class FakeDownloadHandler : HttpMessageHandler
+    {
+        public string? Body { get; set; } = "";
+        public bool Throw { get; set; }
+        public bool FailMidStream { get; set; }
+        public Dictionary<string, string>? ZipEntries { get; set; }
+        public List<string> Requests { get; } = [];
+
+        /// <summary>Filename the fake SHA2-512SUMS line credits, must match the asset under test.</summary>
+        public string Asset { get; set; } = YtDlpResolver.AssetName;
+
+        /// <summary>Wrong on purpose: proves a download that fails SUMS is rejected, not trusted.</summary>
+        public bool CorruptSumsHash { get; set; }
+
+        /// <summary>The SUMS endpoint 404s, as if the release published none.</summary>
+        public bool SumsMissing { get; set; }
+
+        /// <summary>The server accepts the connection and never answers.</summary>
+        public bool StallHeaders { get; set; }
+
+        /// <summary>Headers arrive, a few bytes follow, then the body goes silent.</summary>
+        public bool StallBody { get; set; }
+
+        /// <summary>The asset downloads fine but the checksum fetch never answers.</summary>
+        public bool StallSums { get; set; }
+
+        /// <summary>When set, the asset body reports whether this file existed as its first byte was read.</summary>
+        public string? StagingPathProbe { get; set; }
+
+        public bool StagingExistedAtFirstBodyRead { get; private set; }
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Requests.Add(request.RequestUri!.AbsoluteUri);
+
+            if (Throw) throw new HttpRequestException("network is down");
+
+            var isSums = request.RequestUri!.AbsoluteUri.Contains("SHA2-512SUMS", StringComparison.Ordinal);
+
+            if (StallHeaders || (StallSums && isSums))
+                await Task.Delay(Timeout.Infinite, cancellationToken);
+
+            if (isSums)
+                return BuildSumsResponse();
+
+            HttpContent content = StagingPathProbe is not null
+                ? new StreamContent(new ProbingStream(
+                    Encoding.UTF8.GetBytes(Body ?? ""), () => StagingExistedAtFirstBodyRead = File.Exists(StagingPathProbe)))
+                : StallBody ? new StreamContent(new StallingStream())
+                : FailMidStream ? new StreamContent(new TruncatingStream())
+                : ZipEntries is not null ? new ByteArrayContent(BuildZip(ZipEntries))
+                : new StringContent(Body ?? "");
+
+            return new HttpResponseMessage(HttpStatusCode.OK) { Content = content };
+        }
+
+        private HttpResponseMessage BuildSumsResponse()
+        {
+            if (SumsMissing) return new HttpResponseMessage(HttpStatusCode.NotFound);
+
+            // The real bytes the asset request below will serve: the SUMS line has to match them,
+            // or every test would be exercising the mismatch path instead of the happy one.
+            var bytes = ZipEntries is not null ? BuildZip(ZipEntries) : Encoding.UTF8.GetBytes(Body ?? "");
+
+            var hash = CorruptSumsHash
+                ? new string('0', 128)
+                : Convert.ToHexStringLower(SHA512.HashData(bytes));
+
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent($"{hash}  {Asset}\n")
+            };
+        }
+
+        private static byte[] BuildZip(Dictionary<string, string> entries)
+        {
+            using var buffer = new MemoryStream();
+
+            using (var archive = new ZipArchive(buffer, ZipArchiveMode.Create, leaveOpen: true))
+            {
+                foreach (var (name, body) in entries)
+                {
+                    using var writer = new StreamWriter(archive.CreateEntry(name).Open());
+                    writer.Write(body);
+                }
+            }
+
+            return buffer.ToArray();
+        }
+    }
+
+    /// <summary>Serves a fixed body and reports once, as the first read arrives.</summary>
+    private sealed class ProbingStream(byte[] body, Action onFirstRead) : Stream
+    {
+        private int _position;
+        private bool _probed;
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => body.Length;
+        public override long Position { get => _position; set => throw new NotSupportedException(); }
+
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (!_probed)
+            {
+                _probed = true;
+                onFirstRead();
+            }
+
+            var count = Math.Min(buffer.Length, body.Length - _position);
+            body.AsMemory(_position, count).CopyTo(buffer);
+            _position += count;
+
+            return ValueTask.FromResult(count);
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+            => ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    /// <summary>Hands over a few bytes, then drops: a download interrupted, not one refused.</summary>
+    private sealed class TruncatingStream : Stream
+    {
+        private bool _served;
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => 0; set => throw new NotSupportedException(); }
+
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (_served) throw new IOException("connection reset mid-download");
+
+            _served = true;
+
+            var chunk = Math.Min(buffer.Length, 8);
+            buffer.Span[..chunk].Fill((byte)'x');
+
+            return ValueTask.FromResult(chunk);
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+            => ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    /// <summary>A few bytes, then silence until the read is cancelled: a connection that stays open
+    /// and carries nothing.</summary>
+    private sealed class StallingStream : Stream
+    {
+        private bool _served;
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => 0; set => throw new NotSupportedException(); }
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (!_served)
+            {
+                _served = true;
+                buffer.Span[..4].Fill((byte)'x');
+                return 4;
+            }
+
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+            return 0;
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+            => ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    private sealed class FakeTime : TimeProvider
+    {
+        public DateTimeOffset Now { get; set; } = new(2026, 10, 3, 12, 0, 0, TimeSpan.Zero);
+
+        public override DateTimeOffset GetUtcNow() => Now;
+    }
+}
